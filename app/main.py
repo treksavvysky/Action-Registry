@@ -1,9 +1,11 @@
 from fastapi import FastAPI, HTTPException
-from typing import Dict, List, Any
+from fastapi.responses import JSONResponse
+from typing import Dict, List, Any, Optional
 import hashlib
 
-from app.schemas import ActionList, ActionItem, ActionVersionResponse, SignatureBlock
-from app.crypto import canonical_dumps, sha256_hex, verify_signature_ed25519
+from app.schemas import ActionList, ActionItem, ActionVersionResponse, SignatureBlock, ErrorResponse
+from app.crypto import canonical_dumps, sha256_hex, sha256_prefixed_hex, verify_signature_ed25519, sha256_bytes
+from app.settings import TRUSTED_KEYS
 
 app = FastAPI()
 
@@ -43,6 +45,16 @@ ACTIONS_DB = {
     }
 }
 
+def create_error_response(status_code: int, code: str, message: str, details: Optional[Dict[str, Any]] = None):
+    content = {
+        "error": {
+            "code": code,
+            "message": message,
+            "details": details
+        }
+    }
+    return JSONResponse(status_code=status_code, content=content)
+
 @app.get("/healthz")
 def healthz():
     return {"status": "ok"}
@@ -67,14 +79,14 @@ def list_actions():
         ))
     return ActionList(items=items)
 
-@app.get("/actions/{name}/versions/{version}", response_model=ActionVersionResponse)
+@app.get("/actions/{name}/versions/{version}", response_model=ActionVersionResponse, responses={404: {"model": ErrorResponse}, 400: {"model": ErrorResponse}})
 def get_action_version(name: str, version: str):
     if name not in ACTIONS_DB:
-        raise HTTPException(status_code=404, detail="Action not found")
+        return create_error_response(404, "ACTION_NOT_FOUND", f"Action '{name}' not found")
 
     versions_dict = ACTIONS_DB[name]
     if version not in versions_dict:
-        raise HTTPException(status_code=404, detail="Version not found")
+        return create_error_response(404, "VERSION_NOT_FOUND", f"Version '{version}' not found")
 
     data = versions_dict[version]
     schema_obj = data["schema"]
@@ -82,24 +94,40 @@ def get_action_version(name: str, version: str):
 
     # Compute hash
     canonical_bytes = canonical_dumps(schema_obj)
-    hash_hex = sha256_hex(canonical_bytes)
 
-    # Calculate hash bytes for verification
-    # AGENTS.md recommends signing the hash.
-    hash_bytes = hashlib.sha256(canonical_bytes).digest()
+    # Verify
+    kid = sig_data.get("kid")
+    trusted_entry = TRUSTED_KEYS.get(kid)
 
-    # Verify stub
-    is_verified = verify_signature_ed25519(
-        hash_bytes=hash_bytes,
-        sig_b64=sig_data["sig"],
-        public_key_b64="mock_key" # We don't have key lookup yet
-    )
+    is_verified = False
+    verify_error = None
+
+    if not trusted_entry:
+        verify_error = "Unknown key id"
+        # verified remains False
+    else:
+        alg, pub_key_bytes = trusted_entry
+        if alg != "ed25519":
+             verify_error = f"Unsupported algorithm in trust store: {alg}"
+        else:
+            # We need to verify the hash of the canonical payload
+            hash_bytes_val = sha256_bytes(canonical_bytes)
+
+            if verify_signature_ed25519(
+                hash_bytes=hash_bytes_val,
+                sig_b64=sig_data["sig"],
+                public_key_bytes=pub_key_bytes
+            ):
+                is_verified = True
+            else:
+                verify_error = "Bad signature"
 
     return ActionVersionResponse(
         name=name,
         version=version,
         schema=schema_obj,
-        hash=f"sha256:{hash_hex}",
+        hash=sha256_prefixed_hex(canonical_bytes),
         signature=SignatureBlock(**sig_data),
-        verified=is_verified
+        verified=is_verified,
+        verify_error=verify_error
     )
