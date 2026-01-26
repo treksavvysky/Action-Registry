@@ -143,6 +143,9 @@ git clone https://github.com/your-org/action-registry.git
 cd action-registry
 docker compose up --build
 
+# Or if already in the repo root:
+docker compose up --build
+
 Service listens on:
 	•	API: http://localhost:8000
 	•	Docs: http://localhost:8000/docs
