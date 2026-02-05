@@ -22,3 +22,12 @@ class ActionVersionResponse(BaseModel):
     hash: str
     signature: SignatureBlock
     verified: bool
+    verify_error: Optional[str] = None
+
+class ErrorDetails(BaseModel):
+    code: str
+    message: str
+    details: Optional[Dict[str, Any]] = None
+
+class ErrorResponse(BaseModel):
+    error: ErrorDetails

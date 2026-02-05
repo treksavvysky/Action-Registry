@@ -106,14 +106,30 @@ Example:
   "hash": "sha256:…"
 }
 
-Error codes
+Error Handling & Codes
 
-Responses should use stable error codes for machine clients:
-	•	ACTION_NOT_FOUND
-	•	VERSION_NOT_FOUND
-	•	BAD_SIGNATURE
-	•	UNKNOWN_KEY_ID
-	•	IMMUTABLE_VERSION_CONFLICT
+Errors are returned in a stable JSON envelope:
+
+```json
+{
+  "error": {
+    "code": "ACTION_NOT_FOUND",
+    "message": "Human readable message",
+    "details": { ... }
+  }
+}
+```
+
+Common error codes:
+	•	ACTION_NOT_FOUND (404)
+	•	VERSION_NOT_FOUND (404)
+
+Verification Behavior
+
+When fetching an action version (`GET /actions/{name}/versions/{version}`), the server attempts to verify the signature against the trusted key store.
+
+*   **Success**: Returns `verified: true`.
+*   **Failure**: Returns `verified: false` and includes a `verify_error` field (e.g., "Bad signature", "Unknown key id"). The HTTP status code remains 200 OK to allow inspection of the artifact.
 
 Signing model
 	•	Recommended algorithm: Ed25519
