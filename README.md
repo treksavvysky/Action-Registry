@@ -192,9 +192,18 @@ Minimum tests expected for MVP:
 Roadmap (post-MVP)
 	•	publish endpoint with role-based auth + audit trail
 	•	key rotation + revocation
-	•	deprecation flags + “unsafe” warnings for clients
+	•	deprecation flags + "unsafe" warnings for clients
 	•	event stream for action updates (WebSocket)
 	•	compatibility checks between versions
+
+See [docs/ROADMAP.md](docs/ROADMAP.md) for the full phased roadmap (Phases 1-7).
+
+Further Reading
+	•	[docs/VISION.md](docs/VISION.md) — Why signed action schemas are the foundation of safe multi-agent coordination
+	•	[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — How the registry connects ACE, IntelliSwarm, and CWOM
+	•	[docs/ROADMAP.md](docs/ROADMAP.md) — Phased roadmap from MVP to federated trust layer (8 phases)
+	•	[docs/MCP_INTEGRATION.md](docs/MCP_INTEGRATION.md) — MCP server spec for Claude Code and agent integration
+	•	[docs/GPT_ACTIONS.md](docs/GPT_ACTIONS.md) — Custom GPT Actions via OpenAPI
 
 ⸻
 

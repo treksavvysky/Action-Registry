@@ -1,11 +1,10 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header
 from fastapi.responses import JSONResponse
 from typing import Dict, List, Any, Optional
-import hashlib
 
-from app.schemas import ActionList, ActionItem, ActionVersionResponse, SignatureBlock, ErrorResponse
+from app.schemas import ActionList, ActionItem, ActionVersionResponse, SignatureBlock, ErrorResponse, PublishRequest
 from app.crypto import canonical_dumps, sha256_hex, sha256_prefixed_hex, verify_signature_ed25519, sha256_bytes
-from app.settings import TRUSTED_KEYS
+from app.settings import TRUSTED_KEYS, API_KEY
 
 app = FastAPI()
 
@@ -130,4 +129,75 @@ def get_action_version(name: str, version: str):
         signature=SignatureBlock(**sig_data),
         verified=is_verified,
         verify_error=verify_error
+    )
+
+
+@app.post("/actions/{name}/versions/{version}", status_code=201, response_model=ActionVersionResponse, responses={400: {"model": ErrorResponse}, 401: {"model": ErrorResponse}, 409: {"model": ErrorResponse}})
+def publish_action(name: str, version: str, body: PublishRequest, x_api_key: Optional[str] = Header(None)):
+    # Auth
+    if not API_KEY or not x_api_key or x_api_key != API_KEY:
+        return create_error_response(401, "UNAUTHORIZED", "Invalid or missing API key")
+
+    schema_obj = body.schema_
+    sig_data = body.signature
+
+    # Compute canonical hash
+    canonical_bytes = canonical_dumps(schema_obj)
+    hash_bytes_val = sha256_bytes(canonical_bytes)
+    hash_hex = sha256_prefixed_hex(canonical_bytes)
+
+    # Look up trusted key
+    kid = sig_data.kid
+    trusted_entry = TRUSTED_KEYS.get(kid)
+    if not trusted_entry:
+        return create_error_response(400, "UNKNOWN_KEY_ID", f"Key id '{kid}' is not in the trusted key store")
+
+    alg, pub_key_bytes = trusted_entry
+    if alg != "ed25519":
+        return create_error_response(400, "UNKNOWN_KEY_ID", f"Unsupported algorithm in trust store: {alg}")
+
+    # Verify signature
+    if not verify_signature_ed25519(hash_bytes=hash_bytes_val, sig_b64=sig_data.sig, public_key_bytes=pub_key_bytes):
+        return create_error_response(400, "BAD_SIGNATURE", "Signature verification failed")
+
+    # Immutability check
+    if name in ACTIONS_DB and version in ACTIONS_DB[name]:
+        existing = ACTIONS_DB[name][version]
+        existing_hash = sha256_prefixed_hex(canonical_dumps(existing["schema"]))
+        if existing_hash == hash_hex:
+            # Idempotent — same payload, return 200
+            return JSONResponse(status_code=200, content={
+                "name": name,
+                "version": version,
+                "schema": schema_obj,
+                "hash": hash_hex,
+                "signature": {"alg": sig_data.alg, "kid": sig_data.kid, "sig": sig_data.sig},
+                "verified": True,
+                "verify_error": None
+            })
+        else:
+            return create_error_response(409, "IMMUTABLE_VERSION_CONFLICT",
+                f"Version '{version}' of '{name}' already exists with a different schema")
+
+    # Store
+    if name not in ACTIONS_DB:
+        ACTIONS_DB[name] = {}
+
+    ACTIONS_DB[name][version] = {
+        "schema": schema_obj,
+        "signature": {
+            "alg": sig_data.alg,
+            "kid": sig_data.kid,
+            "sig": sig_data.sig,
+        }
+    }
+
+    return ActionVersionResponse(
+        name=name,
+        version=version,
+        schema=schema_obj,
+        hash=hash_hex,
+        signature=sig_data,
+        verified=True,
+        verify_error=None
     )

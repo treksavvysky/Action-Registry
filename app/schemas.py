@@ -24,6 +24,13 @@ class ActionVersionResponse(BaseModel):
     verified: bool
     verify_error: Optional[str] = None
 
+class PublishRequest(BaseModel):
+    schema_: Dict[str, Any] = Field(..., alias="schema")
+    signature: SignatureBlock
+
+    model_config = {"populate_by_name": True}
+
+
 class ErrorDetails(BaseModel):
     code: str
     message: str

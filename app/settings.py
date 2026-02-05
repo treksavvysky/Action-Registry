@@ -41,3 +41,5 @@ def load_trusted_keys() -> Dict[str, Tuple[str, bytes]]:
     return trusted_keys
 
 TRUSTED_KEYS = load_trusted_keys()
+
+API_KEY = os.getenv("ACTION_REGISTRY_API_KEY")
