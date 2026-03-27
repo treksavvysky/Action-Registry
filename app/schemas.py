@@ -24,6 +24,16 @@ class ActionVersionResponse(BaseModel):
     verified: bool
     verify_error: Optional[str] = None
 
+
+class ActionVerifyResponse(BaseModel):
+    name: str
+    version: str
+    verified: bool
+    kid: str
+    alg: str
+    hash: str
+    verify_error: Optional[str] = None
+
 class PublishRequest(BaseModel):
     schema_: Dict[str, Any] = Field(..., alias="schema")
     signature: SignatureBlock

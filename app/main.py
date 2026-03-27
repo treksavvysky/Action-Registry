@@ -1,196 +1,390 @@
-from fastapi import FastAPI, Header
-from fastapi.responses import JSONResponse
-from typing import Dict, List, Any, Optional
+import json
+import logging
+import time
+import uuid
+from collections import defaultdict
+from typing import Any, Dict, Optional
 
-from app.schemas import ActionList, ActionItem, ActionVersionResponse, SignatureBlock, ErrorResponse, PublishRequest
-from app.crypto import canonical_dumps, sha256_hex, sha256_prefixed_hex, verify_signature_ed25519, sha256_bytes
-from app.settings import TRUSTED_KEYS, API_KEY
+from fastapi import Depends, FastAPI, Header, Query, Request
+from fastapi.responses import JSONResponse, Response
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from app.crypto import canonical_dumps, sha256_bytes, sha256_prefixed_hex, verify_signature_ed25519
+from app.db import engine, get_db
+from app.models import Action, ActionVersion, Base
+from app.schemas import (
+    ActionItem,
+    ActionList,
+    ActionVerifyResponse,
+    ActionVersionResponse,
+    ErrorResponse,
+    PublishRequest,
+    SignatureBlock,
+)
+from app.settings import API_KEY, TRUSTED_KEYS
 
 app = FastAPI()
 
-# In-memory storage
-# Structure: { name: { version: { "schema": ..., "signature": ... } } }
-ACTIONS_DB = {
-    "files.move": {
-        "1.0.0": {
-            "schema": {
-                "description": "Move a file from A to B",
-                "parameters": {
-                    "source": {"type": "string"},
-                    "destination": {"type": "string"}
-                }
-            },
-            "signature": {
-                "alg": "ed25519",
-                "kid": "dev-root-1",
-                "sig": "base64:mock_signature_1.0.0"
-            }
-        },
-        "1.1.0": {
-             "schema": {
-                "description": "Move a file from A to B (optional)",
-                "parameters": {
-                    "source": {"type": "string"},
-                    "destination": {"type": "string"},
-                    "overwrite": {"type": "boolean"}
-                }
-            },
-            "signature": {
-                "alg": "ed25519",
-                "kid": "dev-root-1",
-                "sig": "base64:mock_signature_1.1.0"
-            }
-        }
-    }
-}
+logger = logging.getLogger("action_registry")
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(handler)
+logger.setLevel(logging.INFO)
 
-def create_error_response(status_code: int, code: str, message: str, details: Optional[Dict[str, Any]] = None):
+METRICS = {
+    "http_requests_total": defaultdict(int),
+    "http_request_latency_seconds": defaultdict(int),
+    "publish_total": 0,
+    "verify_pass_total": 0,
+    "verify_fail_total": 0,
+}
+LATENCY_BUCKETS = (0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0)
+
+
+def create_error_response(
+    status_code: int,
+    code: str,
+    message: str,
+    details: Optional[Dict[str, Any]] = None,
+) -> JSONResponse:
     content = {
         "error": {
             "code": code,
             "message": message,
-            "details": details
+            "details": details,
         }
     }
     return JSONResponse(status_code=status_code, content=content)
 
-@app.get("/healthz")
-def healthz():
+
+def _version_sort_key(version: str) -> tuple[int, int, int, str]:
+    parts = version.split(".")
+    if len(parts) == 3 and all(part.isdigit() for part in parts):
+        return (int(parts[0]), int(parts[1]), int(parts[2]), "")
+    return (0, 0, 0, version)
+
+
+def _verify_action_version(av: ActionVersion) -> tuple[bool, Optional[str]]:
+    canonical_bytes = canonical_dumps(av.schema_json)
+    hash_bytes_val = sha256_bytes(canonical_bytes)
+
+    trusted_entry = TRUSTED_KEYS.get(av.sig_kid)
+    if not trusted_entry:
+        METRICS["verify_fail_total"] += 1
+        return False, "Unknown key id"
+
+    alg, pub_key_bytes = trusted_entry
+    if alg != "ed25519":
+        METRICS["verify_fail_total"] += 1
+        return False, f"Unsupported algorithm in trust store: {alg}"
+
+    is_valid = verify_signature_ed25519(
+        hash_bytes=hash_bytes_val,
+        sig_b64=av.sig_b64,
+        public_key_bytes=pub_key_bytes,
+    )
+
+    if is_valid:
+        METRICS["verify_pass_total"] += 1
+        return True, None
+
+    METRICS["verify_fail_total"] += 1
+    return False, "Bad signature"
+
+
+@app.middleware("http")
+async def request_context_middleware(request: Request, call_next):
+    request_id = request.headers.get("x-request-id", str(uuid.uuid4()))
+    start = time.perf_counter()
+    response = await call_next(request)
+    elapsed = time.perf_counter() - start
+
+    response.headers["x-request-id"] = request_id
+
+    status_code = response.status_code
+    route = request.url.path
+    method = request.method
+    METRICS["http_requests_total"][(method, route, str(status_code))] += 1
+    for bucket in LATENCY_BUCKETS:
+        if elapsed <= bucket:
+            METRICS["http_request_latency_seconds"][(route, str(bucket))] += 1
+            break
+    else:
+        METRICS["http_request_latency_seconds"][(route, "+Inf")] += 1
+
+    logger.info(
+        json.dumps(
+            {
+                "request_id": request_id,
+                "method": method,
+                "path": route,
+                "status_code": status_code,
+                "latency_seconds": round(elapsed, 6),
+            }
+        )
+    )
+    return response
+
+
+@app.on_event("startup")
+def on_startup() -> None:
+    Base.metadata.create_all(bind=engine)
+
+
+@app.get("/livez")
+def livez() -> Dict[str, str]:
     return {"status": "ok"}
 
+
+@app.get("/readyz")
+def readyz(db: Session = Depends(get_db)):
+    try:
+        db.execute(select(Action.name).limit(1)).first()
+        return {"status": "ready"}
+    except Exception as exc:
+        return create_error_response(503, "NOT_READY", "Database not ready", {"reason": str(exc)})
+
+
+@app.get("/healthz")
+def healthz() -> Dict[str, str]:
+    return {"status": "ok"}
+
+
+@app.get("/metrics")
+def metrics() -> Response:
+    lines = []
+
+    lines.append("# TYPE action_registry_publish_total counter")
+    lines.append(f"action_registry_publish_total {METRICS['publish_total']}")
+    lines.append("# TYPE action_registry_verify_pass_total counter")
+    lines.append(f"action_registry_verify_pass_total {METRICS['verify_pass_total']}")
+    lines.append("# TYPE action_registry_verify_fail_total counter")
+    lines.append(f"action_registry_verify_fail_total {METRICS['verify_fail_total']}")
+
+    lines.append("# TYPE action_registry_http_requests_total counter")
+    for (method, route, status), count in METRICS["http_requests_total"].items():
+        lines.append(
+            "action_registry_http_requests_total"
+            f'{{method="{method}",route="{route}",status="{status}"}} {count}'
+        )
+
+    lines.append("# TYPE action_registry_http_request_latency_seconds_bucket histogram")
+    for (route, le), count in METRICS["http_request_latency_seconds"].items():
+        lines.append(
+            "action_registry_http_request_latency_seconds_bucket"
+            f'{{route="{route}",le="{le}"}} {count}'
+        )
+
+    return Response(content="\n".join(lines) + "\n", media_type="text/plain; version=0.0.4")
+
+
 @app.get("/actions", response_model=ActionList)
-def list_actions():
+def list_actions(
+    q: str = Query(default="", description="Case-insensitive substring search"),
+    kid: Optional[str] = Query(default=None, description="Filter by signer key id"),
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, ge=1, le=200),
+    db: Session = Depends(get_db),
+) -> ActionList:
+    rows = db.execute(select(ActionVersion)).scalars().all()
+
+    grouped: dict[str, list[ActionVersion]] = defaultdict(list)
+    q_lower = q.lower().strip()
+
+    for row in rows:
+        if kid and row.sig_kid != kid:
+            continue
+        description = str(row.schema_json.get("description", ""))
+        if q_lower and q_lower not in row.name.lower() and q_lower not in description.lower():
+            continue
+        grouped[row.name].append(row)
+
+    action_names = sorted(grouped.keys())
+    page_names = action_names[offset : offset + limit]
+
     items = []
-    for name, versions_dict in ACTIONS_DB.items():
-        versions = sorted(versions_dict.keys()) # simple string sort for now, as per Sprint-0 scope
+    for name in page_names:
+        versions = sorted((row.version for row in grouped[name]), key=_version_sort_key)
         latest = versions[-1] if versions else "0.0.0"
-
-        # Get description from latest version if available
+        latest_row = next((row for row in grouped[name] if row.version == latest), None)
         description = None
-        if latest and latest in versions_dict:
-             description = versions_dict[latest]["schema"].get("description")
+        if latest_row:
+            description = latest_row.schema_json.get("description")
 
-        items.append(ActionItem(
-            name=name,
-            latest_version=latest,
-            versions=versions,
-            description=description
-        ))
+        items.append(
+            ActionItem(
+                name=name,
+                latest_version=latest,
+                versions=versions,
+                description=description,
+            )
+        )
+
     return ActionList(items=items)
 
-@app.get("/actions/{name}/versions/{version}", response_model=ActionVersionResponse, responses={404: {"model": ErrorResponse}, 400: {"model": ErrorResponse}})
-def get_action_version(name: str, version: str):
-    if name not in ACTIONS_DB:
+
+@app.get(
+    "/actions/{name}/versions/{version}",
+    response_model=ActionVersionResponse,
+    responses={404: {"model": ErrorResponse}, 400: {"model": ErrorResponse}},
+)
+def get_action_version(name: str, version: str, db: Session = Depends(get_db)):
+    action = db.get(Action, name)
+    if not action:
         return create_error_response(404, "ACTION_NOT_FOUND", f"Action '{name}' not found")
 
-    versions_dict = ACTIONS_DB[name]
-    if version not in versions_dict:
+    row = (
+        db.execute(
+            select(ActionVersion).where(ActionVersion.name == name, ActionVersion.version == version)
+        )
+        .scalars()
+        .first()
+    )
+    if not row:
         return create_error_response(404, "VERSION_NOT_FOUND", f"Version '{version}' not found")
 
-    data = versions_dict[version]
-    schema_obj = data["schema"]
-    sig_data = data["signature"]
-
-    # Compute hash
-    canonical_bytes = canonical_dumps(schema_obj)
-
-    # Verify
-    kid = sig_data.get("kid")
-    trusted_entry = TRUSTED_KEYS.get(kid)
-
-    is_verified = False
-    verify_error = None
-
-    if not trusted_entry:
-        verify_error = "Unknown key id"
-        # verified remains False
-    else:
-        alg, pub_key_bytes = trusted_entry
-        if alg != "ed25519":
-             verify_error = f"Unsupported algorithm in trust store: {alg}"
-        else:
-            # We need to verify the hash of the canonical payload
-            hash_bytes_val = sha256_bytes(canonical_bytes)
-
-            if verify_signature_ed25519(
-                hash_bytes=hash_bytes_val,
-                sig_b64=sig_data["sig"],
-                public_key_bytes=pub_key_bytes
-            ):
-                is_verified = True
-            else:
-                verify_error = "Bad signature"
+    is_verified, verify_error = _verify_action_version(row)
 
     return ActionVersionResponse(
         name=name,
         version=version,
-        schema=schema_obj,
-        hash=sha256_prefixed_hex(canonical_bytes),
-        signature=SignatureBlock(**sig_data),
+        schema=row.schema_json,
+        hash=row.hash,
+        signature=SignatureBlock(alg=row.sig_alg, kid=row.sig_kid, sig=row.sig_b64),
         verified=is_verified,
-        verify_error=verify_error
+        verify_error=verify_error,
     )
 
 
-@app.post("/actions/{name}/versions/{version}", status_code=201, response_model=ActionVersionResponse, responses={400: {"model": ErrorResponse}, 401: {"model": ErrorResponse}, 409: {"model": ErrorResponse}})
-def publish_action(name: str, version: str, body: PublishRequest, x_api_key: Optional[str] = Header(None)):
-    # Auth
+@app.get(
+    "/actions/{name}/versions/{version}/verify",
+    response_model=ActionVerifyResponse,
+    responses={404: {"model": ErrorResponse}},
+)
+def verify_action_version(name: str, version: str, db: Session = Depends(get_db)):
+    action = db.get(Action, name)
+    if not action:
+        return create_error_response(404, "ACTION_NOT_FOUND", f"Action '{name}' not found")
+
+    row = (
+        db.execute(
+            select(ActionVersion).where(ActionVersion.name == name, ActionVersion.version == version)
+        )
+        .scalars()
+        .first()
+    )
+    if not row:
+        return create_error_response(404, "VERSION_NOT_FOUND", f"Version '{version}' not found")
+
+    is_verified, verify_error = _verify_action_version(row)
+
+    return ActionVerifyResponse(
+        name=name,
+        version=version,
+        verified=is_verified,
+        kid=row.sig_kid,
+        alg=row.sig_alg,
+        hash=row.hash,
+        verify_error=verify_error,
+    )
+
+
+@app.post(
+    "/actions/{name}/versions/{version}",
+    status_code=201,
+    response_model=ActionVersionResponse,
+    responses={400: {"model": ErrorResponse}, 401: {"model": ErrorResponse}, 409: {"model": ErrorResponse}},
+)
+def publish_action(
+    name: str,
+    version: str,
+    body: PublishRequest,
+    x_api_key: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
     if not API_KEY or not x_api_key or x_api_key != API_KEY:
         return create_error_response(401, "UNAUTHORIZED", "Invalid or missing API key")
 
     schema_obj = body.schema_
     sig_data = body.signature
 
-    # Compute canonical hash
     canonical_bytes = canonical_dumps(schema_obj)
     hash_bytes_val = sha256_bytes(canonical_bytes)
     hash_hex = sha256_prefixed_hex(canonical_bytes)
 
-    # Look up trusted key
-    kid = sig_data.kid
-    trusted_entry = TRUSTED_KEYS.get(kid)
+    trusted_entry = TRUSTED_KEYS.get(sig_data.kid)
     if not trusted_entry:
-        return create_error_response(400, "UNKNOWN_KEY_ID", f"Key id '{kid}' is not in the trusted key store")
+        return create_error_response(
+            400,
+            "UNKNOWN_KEY_ID",
+            f"Key id '{sig_data.kid}' is not in the trusted key store",
+        )
 
     alg, pub_key_bytes = trusted_entry
     if alg != "ed25519":
         return create_error_response(400, "UNKNOWN_KEY_ID", f"Unsupported algorithm in trust store: {alg}")
 
-    # Verify signature
-    if not verify_signature_ed25519(hash_bytes=hash_bytes_val, sig_b64=sig_data.sig, public_key_bytes=pub_key_bytes):
+    if not verify_signature_ed25519(
+        hash_bytes=hash_bytes_val,
+        sig_b64=sig_data.sig,
+        public_key_bytes=pub_key_bytes,
+    ):
+        METRICS["verify_fail_total"] += 1
         return create_error_response(400, "BAD_SIGNATURE", "Signature verification failed")
 
-    # Immutability check
-    if name in ACTIONS_DB and version in ACTIONS_DB[name]:
-        existing = ACTIONS_DB[name][version]
-        existing_hash = sha256_prefixed_hex(canonical_dumps(existing["schema"]))
-        if existing_hash == hash_hex:
-            # Idempotent — same payload, return 200
-            return JSONResponse(status_code=200, content={
-                "name": name,
-                "version": version,
-                "schema": schema_obj,
-                "hash": hash_hex,
-                "signature": {"alg": sig_data.alg, "kid": sig_data.kid, "sig": sig_data.sig},
-                "verified": True,
-                "verify_error": None
-            })
-        else:
-            return create_error_response(409, "IMMUTABLE_VERSION_CONFLICT",
-                f"Version '{version}' of '{name}' already exists with a different schema")
+    METRICS["verify_pass_total"] += 1
 
-    # Store
-    if name not in ACTIONS_DB:
-        ACTIONS_DB[name] = {}
+    existing = (
+        db.execute(
+            select(ActionVersion).where(ActionVersion.name == name, ActionVersion.version == version)
+        )
+        .scalars()
+        .first()
+    )
+    if existing:
+        if existing.hash == hash_hex:
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "name": name,
+                    "version": version,
+                    "schema": existing.schema_json,
+                    "hash": existing.hash,
+                    "signature": {
+                        "alg": existing.sig_alg,
+                        "kid": existing.sig_kid,
+                        "sig": existing.sig_b64,
+                    },
+                    "verified": True,
+                    "verify_error": None,
+                },
+            )
+        return create_error_response(
+            409,
+            "IMMUTABLE_VERSION_CONFLICT",
+            f"Version '{version}' of '{name}' already exists with a different schema",
+        )
 
-    ACTIONS_DB[name][version] = {
-        "schema": schema_obj,
-        "signature": {
-            "alg": sig_data.alg,
-            "kid": sig_data.kid,
-            "sig": sig_data.sig,
-        }
-    }
+    action = db.get(Action, name)
+    if not action:
+        action = Action(name=name)
+        db.add(action)
+
+    row = ActionVersion(
+        name=name,
+        version=version,
+        schema_json=schema_obj,
+        hash=hash_hex,
+        sig_alg=sig_data.alg,
+        sig_kid=sig_data.kid,
+        sig_b64=sig_data.sig,
+    )
+    db.add(row)
+    db.commit()
+
+    METRICS["publish_total"] += 1
 
     return ActionVersionResponse(
         name=name,
@@ -199,5 +393,5 @@ def publish_action(name: str, version: str, body: PublishRequest, x_api_key: Opt
         hash=hash_hex,
         signature=sig_data,
         verified=True,
-        verify_error=None
+        verify_error=None,
     )

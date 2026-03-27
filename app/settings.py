@@ -3,6 +3,9 @@ import json
 import base64
 from typing import Dict, Tuple
 
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./action_registry.db")
+
+
 def load_trusted_keys() -> Dict[str, Tuple[str, bytes]]:
     keys_json = os.getenv("TRUSTED_KEYS_JSON")
     keys_path = os.getenv("TRUSTED_KEYS_PATH")

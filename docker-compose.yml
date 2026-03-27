@@ -12,7 +12,9 @@ services:
     depends_on:
       - db
     environment:
-      - DATABASE_URL=postgresql://user:password@db:5432/action_registry_db
+      - DATABASE_URL=postgresql+psycopg2://user:password@db:5432/action_registry_db
+      - ACTION_REGISTRY_API_KEY=dev-secret
+      - TRUSTED_KEYS_JSON=[]
 
   db:
     image: postgres:15-alpine
