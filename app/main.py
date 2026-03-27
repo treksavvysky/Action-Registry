@@ -28,7 +28,14 @@ from app.schemas import (
 )
 from app.settings import API_KEY, TRUSTED_KEYS
 
-app = FastAPI()
+app = FastAPI(
+    title="Action Registry API",
+    description=(
+        "Discover, fetch, verify, and publish signed action schemas. "
+        "Responses include deterministic hash and signature verification state."
+    ),
+    version="0.1.0",
+)
 
 logger = logging.getLogger("action_registry")
 if not logger.handlers:
@@ -153,12 +160,20 @@ async def on_startup() -> None:
         await conn.run_sync(Base.metadata.create_all)
 
 
-@app.get("/livez")
+@app.get(
+    "/livez",
+    summary="Liveness Probe",
+    description="Process-level health check used by orchestration to confirm the service is running.",
+)
 def livez() -> Dict[str, str]:
     return {"status": "ok"}
 
 
-@app.get("/readyz")
+@app.get(
+    "/readyz",
+    summary="Readiness Probe",
+    description="Checks database connectivity and ensures the current Alembic revision matches expected head.",
+)
 async def readyz(db: AsyncSession = Depends(get_db)):
     try:
         result = await db.execute(text("SELECT version_num FROM alembic_version"))
@@ -177,12 +192,23 @@ async def readyz(db: AsyncSession = Depends(get_db)):
         return create_error_response(503, "NOT_READY", "Database not ready", {"reason": str(exc)})
 
 
-@app.get("/healthz")
+@app.get(
+    "/healthz",
+    summary="Basic Health Check",
+    description="Simple health endpoint returning an OK status.",
+)
 def healthz() -> Dict[str, str]:
     return {"status": "ok"}
 
 
-@app.get("/metrics")
+@app.get(
+    "/metrics",
+    summary="Prometheus Metrics",
+    description=(
+        "Exposes request, publish, and verification metrics in Prometheus text format. "
+        "Includes histogram bucket/count/sum for request duration."
+    ),
+)
 def metrics() -> Response:
     lines = []
 
@@ -228,7 +254,15 @@ def metrics() -> Response:
     return Response(content="\n".join(lines) + "\n", media_type="text/plain; version=0.0.4")
 
 
-@app.get("/actions", response_model=ActionList)
+@app.get(
+    "/actions",
+    response_model=ActionList,
+    summary="Discover Actions",
+    description=(
+        "Lists registered action headers. Supports optional text query, signer key filter, "
+        "and pagination controls."
+    ),
+)
 async def list_actions(
     q: str = Query(default="", description="Case-insensitive substring search"),
     kid: Optional[str] = Query(default=None, description="Filter by signer key id"),
@@ -276,6 +310,11 @@ async def list_actions(
 @app.get(
     "/actions/{name}/versions/{version}",
     response_model=ActionVersionResponse,
+    summary="Fetch Versioned Action Schema",
+    description=(
+        "Returns a specific action version including schema payload, stored signature block, "
+        "hash, and live verification result."
+    ),
     responses={404: {"model": ErrorResponse}, 400: {"model": ErrorResponse}},
 )
 async def get_action_version(name: str, version: str, db: AsyncSession = Depends(get_db)):
@@ -306,6 +345,11 @@ async def get_action_version(name: str, version: str, db: AsyncSession = Depends
 @app.get(
     "/actions/{name}/versions/{version}/verify",
     response_model=ActionVerifyResponse,
+    summary="Verify Action Signature",
+    description=(
+        "Performs signature verification for a stored action version and returns verification state "
+        "without returning the full schema payload."
+    ),
     responses={404: {"model": ErrorResponse}},
 )
 async def verify_action_version(name: str, version: str, db: AsyncSession = Depends(get_db)):
@@ -337,6 +381,11 @@ async def verify_action_version(name: str, version: str, db: AsyncSession = Depe
     "/actions/{name}/versions/{version}",
     status_code=201,
     response_model=ActionVersionResponse,
+    summary="Publish Action Version",
+    description=(
+        "Publishes a signed action schema for a specific (name, version). Enforces API key auth, "
+        "signature verification, and immutable version conflict protection."
+    ),
     responses={400: {"model": ErrorResponse}, 401: {"model": ErrorResponse}, 409: {"model": ErrorResponse}},
 )
 async def publish_action(

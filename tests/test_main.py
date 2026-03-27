@@ -416,3 +416,18 @@ def test_metrics_endpoint(client):
     assert 'le="+Inf"' in text
     assert "action_registry_http_request_duration_seconds_count" in text
     assert "action_registry_http_request_duration_seconds_sum" in text
+
+
+def test_openapi_has_route_and_model_metadata(client):
+    c, _ = client
+    resp = c.get("/openapi.json")
+    assert resp.status_code == 200
+    spec = resp.json()
+
+    list_actions_op = spec["paths"]["/actions"]["get"]
+    assert list_actions_op["summary"] == "Discover Actions"
+    assert "pagination controls" in list_actions_op["description"]
+
+    publish_req_schema = spec["components"]["schemas"]["PublishRequest"]
+    assert "example" in publish_req_schema
+    assert "signature" in publish_req_schema["properties"]
