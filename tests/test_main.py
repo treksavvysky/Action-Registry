@@ -6,6 +6,7 @@ import httpx
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 import app.main as main_module
@@ -51,6 +52,16 @@ def client(tmp_path):
     async def _init_models():
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+            await conn.execute(
+                text("CREATE TABLE IF NOT EXISTS alembic_version (version_num VARCHAR(32) NOT NULL)")
+            )
+            expected_head = main_module.get_expected_migration_head()
+            if expected_head:
+                await conn.execute(text("DELETE FROM alembic_version"))
+                await conn.execute(
+                    text("INSERT INTO alembic_version (version_num) VALUES (:version_num)"),
+                    {"version_num": expected_head},
+                )
 
     run_async(_init_models())
 
@@ -139,6 +150,26 @@ def test_probe_endpoints(client):
     ready = c.get("/readyz")
     assert ready.status_code == 200
     assert ready.json() == {"status": "ready"}
+
+
+def test_readyz_fails_when_migrations_behind(client):
+    c, db_factory = client
+
+    async def _downgrade_marker():
+        async with db_factory() as db:
+            await db.execute(text("DELETE FROM alembic_version"))
+            await db.execute(
+                text("INSERT INTO alembic_version (version_num) VALUES (:version_num)"),
+                {"version_num": "000000000000"},
+            )
+            await db.commit()
+
+    run_async(_downgrade_marker())
+
+    resp = c.get("/readyz")
+    assert resp.status_code == 503
+    body = resp.json()
+    assert body["error"]["code"] == "NOT_READY_MIGRATIONS"
 
 
 def test_list_actions(client):
@@ -375,8 +406,13 @@ def test_publish_wrong_auth(client):
 
 def test_metrics_endpoint(client):
     c, _ = client
+    c.get("/healthz")
     resp = c.get("/metrics")
     assert resp.status_code == 200
     text = resp.text
     assert "action_registry_publish_total" in text
     assert "action_registry_http_requests_total" in text
+    assert "action_registry_http_request_duration_seconds_bucket" in text
+    assert 'le="+Inf"' in text
+    assert "action_registry_http_request_duration_seconds_count" in text
+    assert "action_registry_http_request_duration_seconds_sum" in text

@@ -3,11 +3,15 @@ import logging
 import time
 import uuid
 from collections import defaultdict
+from functools import lru_cache
+from pathlib import Path
 from typing import Any, Dict, Optional
 
+from alembic.config import Config
+from alembic.script import ScriptDirectory
 from fastapi import Depends, FastAPI, Header, Query, Request
 from fastapi.responses import JSONResponse, Response
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.crypto import canonical_dumps, sha256_bytes, sha256_prefixed_hex, verify_signature_ed25519
@@ -35,7 +39,9 @@ logger.setLevel(logging.INFO)
 
 METRICS = {
     "http_requests_total": defaultdict(int),
-    "http_request_latency_seconds": defaultdict(int),
+    "http_request_duration_seconds_count": defaultdict(int),
+    "http_request_duration_seconds_sum": defaultdict(float),
+    "http_request_duration_seconds_bucket_raw": defaultdict(int),
     "publish_total": 0,
     "verify_pass_total": 0,
     "verify_fail_total": 0,
@@ -94,6 +100,16 @@ def _verify_action_version(av: ActionVersion) -> tuple[bool, Optional[str]]:
     return False, "Bad signature"
 
 
+@lru_cache(maxsize=1)
+def get_expected_migration_head() -> Optional[str]:
+    alembic_ini = Path(__file__).resolve().parents[1] / "alembic.ini"
+    if not alembic_ini.exists():
+        return None
+    config = Config(str(alembic_ini))
+    script = ScriptDirectory.from_config(config)
+    return script.get_current_head()
+
+
 @app.middleware("http")
 async def request_context_middleware(request: Request, call_next):
     request_id = request.headers.get("x-request-id", str(uuid.uuid4()))
@@ -107,12 +123,15 @@ async def request_context_middleware(request: Request, call_next):
     route = request.url.path
     method = request.method
     METRICS["http_requests_total"][(method, route, str(status_code))] += 1
+    METRICS["http_request_duration_seconds_count"][(method, route)] += 1
+    METRICS["http_request_duration_seconds_sum"][(method, route)] += elapsed
+
     for bucket in LATENCY_BUCKETS:
         if elapsed <= bucket:
-            METRICS["http_request_latency_seconds"][(route, str(bucket))] += 1
+            METRICS["http_request_duration_seconds_bucket_raw"][(method, route, str(bucket))] += 1
             break
     else:
-        METRICS["http_request_latency_seconds"][(route, "+Inf")] += 1
+        METRICS["http_request_duration_seconds_bucket_raw"][(method, route, "+Inf")] += 1
 
     logger.info(
         json.dumps(
@@ -142,8 +161,17 @@ def livez() -> Dict[str, str]:
 @app.get("/readyz")
 async def readyz(db: AsyncSession = Depends(get_db)):
     try:
-        result = await db.execute(select(Action.name).limit(1))
-        result.first()
+        result = await db.execute(text("SELECT version_num FROM alembic_version"))
+        versions = {row[0] for row in result.fetchall()}
+        expected_head = get_expected_migration_head()
+
+        if expected_head and versions != {expected_head}:
+            return create_error_response(
+                503,
+                "NOT_READY_MIGRATIONS",
+                "Database schema is not at expected migration revision",
+                {"expected": expected_head, "current": sorted(versions)},
+            )
         return {"status": "ready"}
     except Exception as exc:
         return create_error_response(503, "NOT_READY", "Database not ready", {"reason": str(exc)})
@@ -172,11 +200,29 @@ def metrics() -> Response:
             f'{{method="{method}",route="{route}",status="{status}"}} {count}'
         )
 
-    lines.append("# TYPE action_registry_http_request_latency_seconds_bucket histogram")
-    for (route, le), count in METRICS["http_request_latency_seconds"].items():
+    lines.append("# TYPE action_registry_http_request_duration_seconds histogram")
+    for method, route in sorted(METRICS["http_request_duration_seconds_count"].keys()):
+        cumulative = 0
+        for bucket in LATENCY_BUCKETS:
+            key = (method, route, str(bucket))
+            cumulative += METRICS["http_request_duration_seconds_bucket_raw"][key]
+            lines.append(
+                "action_registry_http_request_duration_seconds_bucket"
+                f'{{method="{method}",route="{route}",le="{bucket}"}} {cumulative}'
+            )
+        count = METRICS["http_request_duration_seconds_count"][(method, route)]
         lines.append(
-            "action_registry_http_request_latency_seconds_bucket"
-            f'{{route="{route}",le="{le}"}} {count}'
+            "action_registry_http_request_duration_seconds_bucket"
+            f'{{method="{method}",route="{route}",le="+Inf"}} {count}'
+        )
+        lines.append(
+            "action_registry_http_request_duration_seconds_count"
+            f'{{method="{method}",route="{route}"}} {count}'
+        )
+        lines.append(
+            "action_registry_http_request_duration_seconds_sum"
+            f'{{method="{method}",route="{route}"}} '
+            f'{METRICS["http_request_duration_seconds_sum"][(method, route)]:.6f}'
         )
 
     return Response(content="\n".join(lines) + "\n", media_type="text/plain; version=0.0.4")
