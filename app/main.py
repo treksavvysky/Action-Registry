@@ -8,10 +8,10 @@ from typing import Any, Dict, Optional
 from fastapi import Depends, FastAPI, Header, Query, Request
 from fastapi.responses import JSONResponse, Response
 from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.crypto import canonical_dumps, sha256_bytes, sha256_prefixed_hex, verify_signature_ed25519
-from app.db import engine, get_db
+from app.db import async_engine, get_db
 from app.models import Action, ActionVersion, Base
 from app.schemas import (
     ActionItem,
@@ -129,8 +129,9 @@ async def request_context_middleware(request: Request, call_next):
 
 
 @app.on_event("startup")
-def on_startup() -> None:
-    Base.metadata.create_all(bind=engine)
+async def on_startup() -> None:
+    async with async_engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
 
 
 @app.get("/livez")
@@ -139,9 +140,10 @@ def livez() -> Dict[str, str]:
 
 
 @app.get("/readyz")
-def readyz(db: Session = Depends(get_db)):
+async def readyz(db: AsyncSession = Depends(get_db)):
     try:
-        db.execute(select(Action.name).limit(1)).first()
+        result = await db.execute(select(Action.name).limit(1))
+        result.first()
         return {"status": "ready"}
     except Exception as exc:
         return create_error_response(503, "NOT_READY", "Database not ready", {"reason": str(exc)})
@@ -181,14 +183,14 @@ def metrics() -> Response:
 
 
 @app.get("/actions", response_model=ActionList)
-def list_actions(
+async def list_actions(
     q: str = Query(default="", description="Case-insensitive substring search"),
     kid: Optional[str] = Query(default=None, description="Filter by signer key id"),
     offset: int = Query(default=0, ge=0),
     limit: int = Query(default=50, ge=1, le=200),
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
 ) -> ActionList:
-    rows = db.execute(select(ActionVersion)).scalars().all()
+    rows = (await db.execute(select(ActionVersion))).scalars().all()
 
     grouped: dict[str, list[ActionVersion]] = defaultdict(list)
     q_lower = q.lower().strip()
@@ -230,18 +232,15 @@ def list_actions(
     response_model=ActionVersionResponse,
     responses={404: {"model": ErrorResponse}, 400: {"model": ErrorResponse}},
 )
-def get_action_version(name: str, version: str, db: Session = Depends(get_db)):
-    action = db.get(Action, name)
+async def get_action_version(name: str, version: str, db: AsyncSession = Depends(get_db)):
+    action = await db.get(Action, name)
     if not action:
         return create_error_response(404, "ACTION_NOT_FOUND", f"Action '{name}' not found")
 
-    row = (
-        db.execute(
-            select(ActionVersion).where(ActionVersion.name == name, ActionVersion.version == version)
-        )
-        .scalars()
-        .first()
+    row_result = await db.execute(
+        select(ActionVersion).where(ActionVersion.name == name, ActionVersion.version == version)
     )
+    row = row_result.scalars().first()
     if not row:
         return create_error_response(404, "VERSION_NOT_FOUND", f"Version '{version}' not found")
 
@@ -263,18 +262,15 @@ def get_action_version(name: str, version: str, db: Session = Depends(get_db)):
     response_model=ActionVerifyResponse,
     responses={404: {"model": ErrorResponse}},
 )
-def verify_action_version(name: str, version: str, db: Session = Depends(get_db)):
-    action = db.get(Action, name)
+async def verify_action_version(name: str, version: str, db: AsyncSession = Depends(get_db)):
+    action = await db.get(Action, name)
     if not action:
         return create_error_response(404, "ACTION_NOT_FOUND", f"Action '{name}' not found")
 
-    row = (
-        db.execute(
-            select(ActionVersion).where(ActionVersion.name == name, ActionVersion.version == version)
-        )
-        .scalars()
-        .first()
+    row_result = await db.execute(
+        select(ActionVersion).where(ActionVersion.name == name, ActionVersion.version == version)
     )
+    row = row_result.scalars().first()
     if not row:
         return create_error_response(404, "VERSION_NOT_FOUND", f"Version '{version}' not found")
 
@@ -297,12 +293,12 @@ def verify_action_version(name: str, version: str, db: Session = Depends(get_db)
     response_model=ActionVersionResponse,
     responses={400: {"model": ErrorResponse}, 401: {"model": ErrorResponse}, 409: {"model": ErrorResponse}},
 )
-def publish_action(
+async def publish_action(
     name: str,
     version: str,
     body: PublishRequest,
     x_api_key: Optional[str] = Header(None),
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
 ):
     if not API_KEY or not x_api_key or x_api_key != API_KEY:
         return create_error_response(401, "UNAUTHORIZED", "Invalid or missing API key")
@@ -336,13 +332,10 @@ def publish_action(
 
     METRICS["verify_pass_total"] += 1
 
-    existing = (
-        db.execute(
-            select(ActionVersion).where(ActionVersion.name == name, ActionVersion.version == version)
-        )
-        .scalars()
-        .first()
+    existing_result = await db.execute(
+        select(ActionVersion).where(ActionVersion.name == name, ActionVersion.version == version)
     )
+    existing = existing_result.scalars().first()
     if existing:
         if existing.hash == hash_hex:
             return JSONResponse(
@@ -367,7 +360,7 @@ def publish_action(
             f"Version '{version}' of '{name}' already exists with a different schema",
         )
 
-    action = db.get(Action, name)
+    action = await db.get(Action, name)
     if not action:
         action = Action(name=name)
         db.add(action)
@@ -382,7 +375,7 @@ def publish_action(
         sig_b64=sig_data.sig,
     )
     db.add(row)
-    db.commit()
+    await db.commit()
 
     METRICS["publish_total"] += 1
 

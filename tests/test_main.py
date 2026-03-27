@@ -1,13 +1,12 @@
 import asyncio
 import base64
+from unittest.mock import patch
 
 import httpx
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-from unittest.mock import patch
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 import app.main as main_module
 from app.crypto import canonical_dumps, sha256_bytes, sha256_prefixed_hex
@@ -20,6 +19,10 @@ from app.settings import TRUSTED_KEYS
 TEST_API_KEY = "test-secret-key"
 
 
+def run_async(coro):
+    return asyncio.run(coro)
+
+
 class ASGIClient:
     def request(self, method: str, path: str, **kwargs):
         async def _request():
@@ -30,7 +33,7 @@ class ASGIClient:
             ) as client:
                 return await client.request(method, path, **kwargs)
 
-        return asyncio.run(_request())
+        return run_async(_request())
 
     def get(self, path: str, **kwargs):
         return self.request("GET", path, **kwargs)
@@ -42,28 +45,31 @@ class ASGIClient:
 @pytest.fixture()
 def client(tmp_path):
     db_path = tmp_path / "test.db"
-    engine = create_engine(
-        f"sqlite:///{db_path}",
-        connect_args={"check_same_thread": False},
-    )
-    TestingSessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
+    TestingSessionLocal = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
 
-    Base.metadata.create_all(bind=engine)
+    async def _init_models():
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
 
-    def override_get_db():
-        db = TestingSessionLocal()
-        try:
+    run_async(_init_models())
+
+    async def override_get_db():
+        async with TestingSessionLocal() as db:
             yield db
-        finally:
-            db.close()
 
     app.dependency_overrides[get_db] = override_get_db
 
     yield ASGIClient(), TestingSessionLocal
 
     app.dependency_overrides.clear()
-    Base.metadata.drop_all(bind=engine)
-    engine.dispose()
+
+    async def _teardown_models():
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.drop_all)
+        await engine.dispose()
+
+    run_async(_teardown_models())
 
 
 def generate_key_and_sig(payload):
@@ -80,21 +86,33 @@ def generate_key_and_sig(payload):
 
 
 def seed_action(db_factory, name: str, version: str, schema: dict, sig_alg: str, sig_kid: str, sig_b64: str):
-    with db_factory() as db:
-        if not db.get(Action, name):
-            db.add(Action(name=name))
-        db.add(
-            ActionVersion(
-                name=name,
-                version=version,
-                schema_json=schema,
-                hash=sha256_prefixed_hex(canonical_dumps(schema)),
-                sig_alg=sig_alg,
-                sig_kid=sig_kid,
-                sig_b64=sig_b64,
+    async def _seed():
+        async with db_factory() as db:
+            if not await db.get(Action, name):
+                db.add(Action(name=name))
+            db.add(
+                ActionVersion(
+                    name=name,
+                    version=version,
+                    schema_json=schema,
+                    hash=sha256_prefixed_hex(canonical_dumps(schema)),
+                    sig_alg=sig_alg,
+                    sig_kid=sig_kid,
+                    sig_b64=sig_b64,
+                )
             )
-        )
-        db.commit()
+            await db.commit()
+
+    run_async(_seed())
+
+
+def seed_action_name(db_factory, name: str):
+    async def _seed():
+        async with db_factory() as db:
+            db.add(Action(name=name))
+            await db.commit()
+
+    run_async(_seed())
 
 
 def _publish(client, name, version, schema, sig_block, api_key=TEST_API_KEY):
@@ -126,7 +144,10 @@ def test_probe_endpoints(client):
 def test_list_actions(client):
     c, db_factory = client
     payload1 = {"description": "Move v1", "parameters": {"source": {"type": "string"}}}
-    payload2 = {"description": "Move v2", "parameters": {"source": {"type": "string"}, "overwrite": {"type": "boolean"}}}
+    payload2 = {
+        "description": "Move v2",
+        "parameters": {"source": {"type": "string"}, "overwrite": {"type": "boolean"}},
+    }
     pub_bytes, sig1, priv = generate_key_and_sig(payload1)
     sig2 = base64.b64encode(priv.sign(sha256_bytes(canonical_dumps(payload2)))).decode("utf-8")
 
@@ -235,9 +256,7 @@ def test_not_found_errors(client):
     assert response.status_code == 404
     assert response.json()["error"]["code"] == "ACTION_NOT_FOUND"
 
-    with db_factory() as db:
-        db.add(Action(name="exists"))
-        db.commit()
+    seed_action_name(db_factory, "exists")
 
     response = c.get("/actions/exists/versions/missing")
     assert response.status_code == 404

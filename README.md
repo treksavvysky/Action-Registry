@@ -42,7 +42,7 @@ The service uses SQLAlchemy models backed by `actions` and `action_versions` tab
 
 Create `.env` from `.env.example`.
 
-- `DATABASE_URL` (default: `sqlite:///./action_registry.db`)
+- `DATABASE_URL` (default: `sqlite+aiosqlite:///./action_registry.db`)
 - `ACTION_REGISTRY_API_KEY`
 - `TRUSTED_KEYS_JSON` or `TRUSTED_KEYS_PATH`
 
